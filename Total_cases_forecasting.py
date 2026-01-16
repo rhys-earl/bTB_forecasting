@@ -20,6 +20,7 @@ import argparse
 import logging
 import numpy as np
 import pandas as pd
+import pyreadr
 
 import torch
 from darts import TimeSeries
@@ -39,7 +40,7 @@ from darts.models import (
 # -----------------------------
 # USER-EDITABLE SETTINGS
 # -----------------------------
-CSV_PATH = "all_cases_12_Jan_2026.csv"   # <-- change me
+CSV_PATH = "all_cases_12_Jan_2026.rds"   # <-- change me
 OUT_DIR = "results"                            # <-- change me
 
 DATE_COL = "merged_date_min"                            # <-- change me if needed
@@ -184,17 +185,25 @@ def calculate_wis_components(row: pd.Series):
 #   - else count rows per month
 # Missing months filled with 0.
 # -----------------------------
-def load_cases_monthly(csv_path: str, date_col: str) -> pd.Series:
-    df = pd.read_csv(csv_path)
+def load_cases_monthly(rds_path: str, date_col: str) -> pd.Series:
+    # Read RDS
+    result = pyreadr.read_r(rds_path)
+
+    # RDS can contain multiple objects; take the first
+    df = next(iter(result.values()))
+
     if date_col not in df.columns:
-        raise ValueError(f"DATE_COL='{date_col}' not found in CSV. Available columns: {list(df.columns)}")
+        raise ValueError(
+            f"DATE_COL='{date_col}' not found in RDS. "
+            f"Available columns: {list(df.columns)}"
+        )
 
     df[date_col] = pd.to_datetime(df[date_col])
     df["month"] = df[date_col].dt.to_period("M").dt.to_timestamp()
 
+    # Automatically detect case column
     case_col = None
     if "case" in df.columns:
-        # try to treat as numeric sum
         s = pd.to_numeric(df["case"], errors="coerce")
         if s.notna().any():
             case_col = "case"
@@ -208,11 +217,14 @@ def load_cases_monthly(csv_path: str, date_col: str) -> pd.Series:
 
     monthly = monthly.sort_index()
 
+    # Fill missing months with 0
     full_idx = pd.date_range(monthly.index.min(), monthly.index.max(), freq="MS")
     monthly = monthly.reindex(full_idx, fill_value=0.0)
     monthly.index = pd.DatetimeIndex(monthly.index, freq="MS")
     monthly.name = "cases"
+
     return monthly
+
 
 # -----------------------------
 # Auto lag length
