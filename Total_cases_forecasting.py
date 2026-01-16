@@ -396,7 +396,7 @@ if __name__ == "__main__":
 
     detailed_path = os.path.join(
         out_dir,
-        f"seasonal_rolling_to_dec_{args.season_end_year}_lag{lag_length}_S{NUM_SAMPLES}.csv"
+        f"seasonal_rolling{args.season_end_year}.csv"
     )
     df_fc.to_csv(detailed_path, index=False)
     logging.info(f"Saved detailed results: {detailed_path}")
@@ -418,7 +418,7 @@ if __name__ == "__main__":
 
     summary_path = os.path.join(
         out_dir,
-        f"seasonal_summary_to_dec_{args.season_end_year}.csv"
+        f"seasonal_summary_{args.season_end_year}.csv"
     )
     summary.to_csv(summary_path, index=False)
     logging.info(f"Saved summary results: {summary_path}")
