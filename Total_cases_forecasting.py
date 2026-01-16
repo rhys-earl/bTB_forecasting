@@ -6,6 +6,7 @@
 #
 # CLI usage:
 #   python seasonal_rolling_forecast_single_year.py ARIMA 2016
+#   python seasonal_rolling_forecast_single_year.py Prophet 2016
 #   python seasonal_rolling_forecast_single_year.py "Linear Regress" 2020
 #
 # You only specify:
@@ -41,9 +42,9 @@ from darts.models import (
 # USER-EDITABLE SETTINGS
 # -----------------------------
 CSV_PATH = "all_cases_12_Jan_2026.rds"   # <-- change me
-OUT_DIR = "results"                            # <-- change me
+OUT_DIR = "results"                     # <-- change me
 
-DATE_COL = "merged_date_min"                            # <-- change me if needed
+DATE_COL = "merged_date_min"            # <-- change me if needed
 
 # If you want to FORCE a lag length, set this to an int (months), e.g., 24.
 # If None, it will be chosen automatically from the available history.
@@ -133,17 +134,15 @@ def get_model(model_name: str, forecast_length: int, lag_length: int):
         raise ValueError(f"Unsupported model: {model_name}")
 
 def model_is_probabilistic(model_name: str) -> bool:
-    # Models that can naturally produce samples / quantiles in this setup
     return model_name in {"TiDE", "NBEATS", "NHiTS", "DLinear", "NLinear", "Linear Regress"}
 
 def choose_num_samples(model_name: str) -> int:
     if NUM_SAMPLES_OVERRIDE is not None:
         return int(NUM_SAMPLES_OVERRIDE)
-    # If the model isn't probabilistic here, num_samples isn't needed; we still pass 1 safely.
     return 1000 if model_is_probabilistic(model_name) else 1
 
 # -----------------------------
-# WIS components (same as your earlier approach)
+# WIS components
 # -----------------------------
 def calculate_wis_components(row: pd.Series):
     alphas = QUANTILES
@@ -179,17 +178,10 @@ def calculate_wis_components(row: pd.Series):
     return wis_total, sharpness_total, calibration_total, bias
 
 # -----------------------------
-# Load case-level CSV -> monthly series
-# case_col detection:
-#   - if a numeric 'case' column exists, sum it per month
-#   - else count rows per month
-# Missing months filled with 0.
+# Load case-level RDS -> monthly series
 # -----------------------------
 def load_cases_monthly(rds_path: str, date_col: str) -> pd.Series:
-    # Read RDS
     result = pyreadr.read_r(rds_path)
-
-    # RDS can contain multiple objects; take the first
     df = next(iter(result.values()))
 
     if date_col not in df.columns:
@@ -225,25 +217,29 @@ def load_cases_monthly(rds_path: str, date_col: str) -> pd.Series:
 
     return monthly
 
-
 # -----------------------------
 # Auto lag length
-# Heuristic: use 24 months if possible, else 12, else max allowed.
 # -----------------------------
 def choose_lag_length(monthly_series: pd.Series) -> int:
     if LAG_LENGTH_OVERRIDE is not None:
         return int(LAG_LENGTH_OVERRIDE)
 
     n = len(monthly_series)
-    # Need at least (lag + 1) to fit most models; deep models need more.
     if n >= 60:
         return 24
     if n >= 36:
         return 18
     if n >= 24:
         return 12
-    # fallback: keep it small but valid
     return max(4, min(12, n // 2))
+
+# -----------------------------
+# Compute integer month horizon between two Periods
+# end_p is later than origin_p
+# -----------------------------
+def months_ahead(origin_p: pd.Period, end_p: pd.Period) -> int:
+    # This avoids getting a MonthEnd offset like "<15 * MonthEnds>"
+    return int(end_p.ordinal - origin_p.ordinal)
 
 # -----------------------------
 # Seasonal rolling forecast for ONE season ending Dec of Y
@@ -271,9 +267,11 @@ def run_one_season_to_december(
     rows = []
 
     for origin_p in origin_periods:
-        h = (end_period - origin_p)  # months ahead to Dec Y -> 15..4
-        origin_ts = origin_p.to_timestamp(how="start")
+        h = months_ahead(origin_p, end_period)  # 15..4 as an INT
+        if h <= 0:
+            continue
 
+        origin_ts = origin_p.to_timestamp(how="start")
         if origin_ts not in series_pd.index:
             continue
 
@@ -290,7 +288,11 @@ def run_one_season_to_december(
         model = get_model(model_name=model_name, forecast_length=h, lag_length=lag_length)
         model.fit(train_ts)
 
-        fc = model.predict(h, num_samples=num_samples)
+        # Prophet is deterministic in Darts; don't pass num_samples
+        if model_name == "Prophet":
+            fc = model.predict(h)
+        else:
+            fc = model.predict(h, num_samples=num_samples)
 
         for k in range(1, h + 1):
             target_p = origin_p + k
@@ -311,10 +313,12 @@ def run_one_season_to_december(
                 "num_samples": num_samples,
             }
 
+            # Quantiles at lead k (index k-1)
             try:
                 for q in QUANTILES:
                     entry[f"forecast_{int(q * 1000)}"] = float(fc.quantile(q).values()[k - 1, 0])
             except Exception:
+                # deterministic fallback -> replicate across quantiles
                 point = float(fc.values()[k - 1, 0])
                 for q in QUANTILES:
                     entry[f"forecast_{int(q * 1000)}"] = point
@@ -358,10 +362,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Seasonal rolling forecast for ONE season ending in Dec of year Y."
     )
-    parser.add_argument("model", type=str,
-                        help='Model name: TiDE, NBEATS, NHiTS, DLinear, NLinear, Prophet, ARIMA, ETS, "Linear Regress"')
-    parser.add_argument("season_end_year", type=int,
-                        help="December year Y. Runs origins Sep (Y-1) .. Aug (Y), forecasting to Dec Y.")
+    parser.add_argument(
+        "model",
+        type=str,
+        help='Model name: TiDE, NBEATS, NHiTS, DLinear, NLinear, Prophet, ARIMA, ETS, "Linear Regress"',
+    )
+    parser.add_argument(
+        "season_end_year",
+        type=int,
+        help="December year Y. Runs origins Sep (Y-1) .. Aug (Y), forecasting to Dec Y.",
+    )
     args = parser.parse_args()
 
     # Load monthly cases
@@ -369,7 +379,7 @@ if __name__ == "__main__":
     logging.info(f"Monthly series spans {monthly_cases.index.min().date()} to {monthly_cases.index.max().date()}")
     logging.info(f"Total months: {len(monthly_cases)}")
 
-    # Choose lag length + samples automatically (unless overridden at top)
+    # Choose lag length + samples (unless overridden at top)
     lag_length = choose_lag_length(monthly_cases)
     num_samples = choose_num_samples(args.model)
     logging.info(f"Using lag_length={lag_length} months")
@@ -390,7 +400,7 @@ if __name__ == "__main__":
 
     detailed_path = os.path.join(
         out_dir,
-        f"seasonal_rolling_to_dec_{args.season_end_year}.csv"
+        f"seasonal_rolling_to_dec_{args.season_end_year}_lag{lag_length}.csv"
     )
     df_fc.to_csv(detailed_path, index=False)
     logging.info(f"Saved detailed results: {detailed_path}")
