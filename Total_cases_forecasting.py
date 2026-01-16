@@ -1,19 +1,24 @@
-# seasonal_rolling_forecast_single_year.py
+# Total_cases_forecasting.py
 # ------------------------------------------------------------
-# Rolling seasonal forecast for ONE season ending in December of Y
+# Rolling seasonal forecast for ONE season ending in December of Y (monthly)
 # Origins: Sep (Y-1) .. Aug (Y)  => horizons 15..4 months
 # Evaluate ALL leads (1..h) and save per-lead metrics (WIS, MAPE, etc.)
 #
 # CLI usage:
-#   python seasonal_rolling_forecast_single_year.py ARIMA 2016
-#   python seasonal_rolling_forecast_single_year.py Prophet 2016
-#   python seasonal_rolling_forecast_single_year.py "Linear Regress" 2020
+#   python Total_cases_forecasting.py ARIMA 2016
+#   python Total_cases_forecasting.py Prophet 2016
+#   python Total_cases_forecasting.py "Linear Regress" 2020
 #
 # You only specify:
 #   1) model
 #   2) season_end_year (December year)
 #
 # Everything else is configured below as constants (easy to edit).
+#
+# This script ENFORCES probabilistic forecasts:
+#   - always calls predict(..., num_samples=NUM_SAMPLES)
+#   - requires forecast TimeSeries to have n_samples > 1
+#     (otherwise raises with a clear message)
 # ------------------------------------------------------------
 
 import os
@@ -41,23 +46,16 @@ from darts.models import (
 # -----------------------------
 # USER-EDITABLE SETTINGS
 # -----------------------------
-CSV_PATH = "all_cases_12_Jan_2026.rds"   # <-- change me
-OUT_DIR = "results"                     # <-- change me
+RDS_PATH = "all_cases_12_Jan_2026.rds"   # <-- your file
+OUT_DIR = "results"                     # <-- change if you want
+DATE_COL = "merged_date_min"            # <-- change if needed
 
-DATE_COL = "merged_date_min"            # <-- change me if needed
+# Probabilistic forecasting settings
+NUM_SAMPLES = 1000                      # <-- always used (enforced)
+MIN_TRAIN_MONTHS = 36                   # <-- minimum expanding-window history
+LAG_LENGTH_OVERRIDE = None              # <-- set int to force; else auto
 
-# If you want to FORCE a lag length, set this to an int (months), e.g., 24.
-# If None, it will be chosen automatically from the available history.
-LAG_LENGTH_OVERRIDE = None
-
-# If you want to FORCE number of samples for probabilistic models, set an int (e.g., 1000).
-# If None, it will be chosen automatically per model.
-NUM_SAMPLES_OVERRIDE = 1000
-
-# Optional minimum training history (months). If None, only basic checks apply.
-MIN_TRAIN_MONTHS = 36
-
-# Quantiles for probabilistic forecasts
+# Quantiles for WIS + output columns
 QUANTILES = [
     0.01, 0.025, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
     0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.975, 0.99
@@ -78,8 +76,9 @@ else:
 torch.set_num_threads(4)
 
 # -----------------------------
-# Helpers: model factory
-# Monthly seasonality => season_length=12
+# Model factory (monthly seasonality => season_length=12)
+# Deep models use QuantileRegression -> already probabilistic.
+# For stats models (Prophet/ARIMA/ETS), we still request num_samples at predict time.
 # -----------------------------
 def get_model(model_name: str, forecast_length: int, lag_length: int):
     if model_name == "TiDE":
@@ -117,12 +116,6 @@ def get_model(model_name: str, forecast_length: int, lag_length: int):
             likelihood=QuantileRegression(quantiles=QUANTILES),
             pl_trainer_kwargs=pl_trainer_kwargs,
         )
-    elif model_name == "Prophet":
-        return Prophet(yearly_seasonality=True)
-    elif model_name == "ARIMA":
-        return StatsForecastAutoARIMA(season_length=12)
-    elif model_name == "ETS":
-        return StatsForecastAutoETS(season_length=12)
     elif model_name == "Linear Regress":
         return LinearRegressionModel(
             lags=lag_length,
@@ -130,16 +123,16 @@ def get_model(model_name: str, forecast_length: int, lag_length: int):
             likelihood="quantile",
             quantiles=QUANTILES,
         )
+    elif model_name == "Prophet":
+        # Note: probabilistic behaviour depends on Darts/Prophet backend;
+        # we enforce num_samples at predict time and fail if n_samples==1.
+        return Prophet(yearly_seasonality=True)
+    elif model_name == "ARIMA":
+        return StatsForecastAutoARIMA(season_length=12)
+    elif model_name == "ETS":
+        return StatsForecastAutoETS(season_length=12)
     else:
         raise ValueError(f"Unsupported model: {model_name}")
-
-def model_is_probabilistic(model_name: str) -> bool:
-    return model_name in {"TiDE", "NBEATS", "NHiTS", "DLinear", "NLinear", "Linear Regress"}
-
-def choose_num_samples(model_name: str) -> int:
-    if NUM_SAMPLES_OVERRIDE is not None:
-        return int(NUM_SAMPLES_OVERRIDE)
-    return 1000 if model_is_probabilistic(model_name) else 1
 
 # -----------------------------
 # WIS components
@@ -178,7 +171,9 @@ def calculate_wis_components(row: pd.Series):
     return wis_total, sharpness_total, calibration_total, bias
 
 # -----------------------------
-# Load case-level RDS -> monthly series
+# Load RDS -> monthly series
+# Uses 'case' column if numeric; otherwise counts rows per month.
+# Missing months filled with 0.
 # -----------------------------
 def load_cases_monthly(rds_path: str, date_col: str) -> pd.Series:
     result = pyreadr.read_r(rds_path)
@@ -186,14 +181,12 @@ def load_cases_monthly(rds_path: str, date_col: str) -> pd.Series:
 
     if date_col not in df.columns:
         raise ValueError(
-            f"DATE_COL='{date_col}' not found in RDS. "
-            f"Available columns: {list(df.columns)}"
+            f"DATE_COL='{date_col}' not found in RDS. Available columns: {list(df.columns)}"
         )
 
     df[date_col] = pd.to_datetime(df[date_col])
     df["month"] = df[date_col].dt.to_period("M").dt.to_timestamp()
 
-    # Automatically detect case column
     case_col = None
     if "case" in df.columns:
         s = pd.to_numeric(df["case"], errors="coerce")
@@ -208,13 +201,10 @@ def load_cases_monthly(rds_path: str, date_col: str) -> pd.Series:
         logging.info("No usable numeric 'case' column found; counting rows per month.")
 
     monthly = monthly.sort_index()
-
-    # Fill missing months with 0
     full_idx = pd.date_range(monthly.index.min(), monthly.index.max(), freq="MS")
     monthly = monthly.reindex(full_idx, fill_value=0.0)
     monthly.index = pd.DatetimeIndex(monthly.index, freq="MS")
     monthly.name = "cases"
-
     return monthly
 
 # -----------------------------
@@ -234,12 +224,29 @@ def choose_lag_length(monthly_series: pd.Series) -> int:
     return max(4, min(12, n // 2))
 
 # -----------------------------
-# Compute integer month horizon between two Periods
-# end_p is later than origin_p
+# integer months between Periods
+# end_p later than origin_p
 # -----------------------------
 def months_ahead(origin_p: pd.Period, end_p: pd.Period) -> int:
-    # This avoids getting a MonthEnd offset like "<15 * MonthEnds>"
     return int(end_p.ordinal - origin_p.ordinal)
+
+# -----------------------------
+# Enforce probabilistic forecast output
+# -----------------------------
+def predict_probabilistic(model, h: int) -> TimeSeries:
+    # Always request samples
+    fc = model.predict(h, num_samples=int(NUM_SAMPLES))
+    n_samp = getattr(fc, "n_samples", 1)
+
+    # Fail fast if model did not return a stochastic forecast
+    if n_samp <= 1:
+        raise RuntimeError(
+            "Model forecast is deterministic (n_samples=1) even though num_samples was requested.\n"
+            "This means quantiles/WIS are not valid for this model in this configuration.\n"
+            "Try a different model, or check Darts/Prophet/StatsForecast versions.\n"
+            f"Requested NUM_SAMPLES={NUM_SAMPLES}, got n_samples={n_samp}."
+        )
+    return fc
 
 # -----------------------------
 # Seasonal rolling forecast for ONE season ending Dec of Y
@@ -249,10 +256,9 @@ def run_one_season_to_december(
     model_name: str,
     season_end_year: int,
     lag_length: int,
-    num_samples: int,
 ):
     Y = int(season_end_year)
-    end_period = pd.Period(f"{Y}-12", freq="M")  # December Y
+    end_period = pd.Period(f"{Y}-12", freq="M")
     last_target_ts = end_period.to_timestamp(how="start")
 
     if last_target_ts not in series_pd.index:
@@ -260,14 +266,14 @@ def run_one_season_to_december(
             f"Data does not include December {Y}. Last available month is {series_pd.index.max().date()}."
         )
 
-    origin_start = pd.Period(f"{Y-1}-09", freq="M")  # Sep (Y-1)
-    origin_end = pd.Period(f"{Y}-08", freq="M")      # Aug (Y)
+    origin_start = pd.Period(f"{Y-1}-09", freq="M")
+    origin_end = pd.Period(f"{Y}-08", freq="M")
     origin_periods = pd.period_range(origin_start, origin_end, freq="M")
 
     rows = []
 
     for origin_p in origin_periods:
-        h = months_ahead(origin_p, end_period)  # 15..4 as an INT
+        h = months_ahead(origin_p, end_period)  # int 15..4
         if h <= 0:
             continue
 
@@ -275,7 +281,6 @@ def run_one_season_to_december(
         if origin_ts not in series_pd.index:
             continue
 
-        # training = all history up to origin (inclusive)
         train_slice = series_pd.loc[:origin_ts]
 
         if MIN_TRAIN_MONTHS is not None and len(train_slice) < MIN_TRAIN_MONTHS:
@@ -288,11 +293,9 @@ def run_one_season_to_december(
         model = get_model(model_name=model_name, forecast_length=h, lag_length=lag_length)
         model.fit(train_ts)
 
-        # Prophet is deterministic in Darts; don't pass num_samples
-        if model_name == "Prophet":
-            fc = model.predict(h)
-        else:
-            fc = model.predict(h, num_samples=num_samples)
+        # --- probabilistic forecast (enforced) ---
+        fc = predict_probabilistic(model, h)
+        # ----------------------------------------
 
         for k in range(1, h + 1):
             target_p = origin_p + k
@@ -310,18 +313,12 @@ def run_one_season_to_december(
                 "actual": y_true,
                 "model": model_name,
                 "lag_length": lag_length,
-                "num_samples": num_samples,
+                "num_samples": int(NUM_SAMPLES),
             }
 
             # Quantiles at lead k (index k-1)
-            try:
-                for q in QUANTILES:
-                    entry[f"forecast_{int(q * 1000)}"] = float(fc.quantile(q).values()[k - 1, 0])
-            except Exception:
-                # deterministic fallback -> replicate across quantiles
-                point = float(fc.values()[k - 1, 0])
-                for q in QUANTILES:
-                    entry[f"forecast_{int(q * 1000)}"] = point
+            for q in QUANTILES:
+                entry[f"forecast_{int(q * 1000)}"] = float(fc.quantile(q).values()[k - 1, 0])
 
             rows.append(entry)
 
@@ -339,6 +336,7 @@ def run_one_season_to_december(
         calculate_wis_components, axis=1, result_type="expand"
     )
 
+    # Point forecast (median)
     yhat = df_fc["forecast_500"].astype(float)
     y = df_fc["actual"].astype(float)
     ae = (yhat - y).abs()
@@ -360,7 +358,7 @@ def run_one_season_to_december(
 # -----------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Seasonal rolling forecast for ONE season ending in Dec of year Y."
+        description="Seasonal rolling probabilistic forecast for ONE season ending in Dec of year Y."
     )
     parser.add_argument(
         "model",
@@ -375,15 +373,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Load monthly cases
-    monthly_cases = load_cases_monthly(CSV_PATH, DATE_COL)
+    monthly_cases = load_cases_monthly(RDS_PATH, DATE_COL)
     logging.info(f"Monthly series spans {monthly_cases.index.min().date()} to {monthly_cases.index.max().date()}")
     logging.info(f"Total months: {len(monthly_cases)}")
 
-    # Choose lag length + samples (unless overridden at top)
+    # Choose lag length automatically (unless overridden)
     lag_length = choose_lag_length(monthly_cases)
-    num_samples = choose_num_samples(args.model)
     logging.info(f"Using lag_length={lag_length} months")
-    logging.info(f"Using num_samples={num_samples}")
+    logging.info(f"Enforcing NUM_SAMPLES={NUM_SAMPLES} for probabilistic forecasts")
 
     # Run the season
     df_fc = run_one_season_to_december(
@@ -391,7 +388,6 @@ if __name__ == "__main__":
         model_name=args.model,
         season_end_year=args.season_end_year,
         lag_length=lag_length,
-        num_samples=num_samples,
     )
 
     # Output paths
@@ -400,7 +396,7 @@ if __name__ == "__main__":
 
     detailed_path = os.path.join(
         out_dir,
-        f"seasonal_rolling_to_dec_{args.season_end_year}_lag{lag_length}.csv"
+        f"seasonal_rolling_to_dec_{args.season_end_year}_lag{lag_length}_S{NUM_SAMPLES}.csv"
     )
     df_fc.to_csv(detailed_path, index=False)
     logging.info(f"Saved detailed results: {detailed_path}")
@@ -422,7 +418,7 @@ if __name__ == "__main__":
 
     summary_path = os.path.join(
         out_dir,
-        f"seasonal_summary_to_dec_{args.season_end_year}_lag{lag_length}.csv"
+        f"seasonal_summary_to_dec_{args.season_end_year}_lag{lag_length}_S{NUM_SAMPLES}.csv"
     )
     summary.to_csv(summary_path, index=False)
     logging.info(f"Saved summary results: {summary_path}")
