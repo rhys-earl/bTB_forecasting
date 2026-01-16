@@ -39,8 +39,8 @@ from darts.models import (
 # -----------------------------
 # USER-EDITABLE SETTINGS
 # -----------------------------
-CSV_PATH = "all_cases_collapsed_rhys_12_Jan_2026.csv"   # <-- change me
-OUT_DIR = "results_seasonal"                            # <-- change me
+CSV_PATH = "all_cases_12_Jan_2026.csv"   # <-- change me
+OUT_DIR = "results"                            # <-- change me
 
 DATE_COL = "merged_date_min"                            # <-- change me if needed
 
@@ -50,10 +50,10 @@ LAG_LENGTH_OVERRIDE = None
 
 # If you want to FORCE number of samples for probabilistic models, set an int (e.g., 1000).
 # If None, it will be chosen automatically per model.
-NUM_SAMPLES_OVERRIDE = None
+NUM_SAMPLES_OVERRIDE = 1000
 
 # Optional minimum training history (months). If None, only basic checks apply.
-MIN_TRAIN_MONTHS = None
+MIN_TRAIN_MONTHS = 36
 
 # Quantiles for probabilistic forecasts
 QUANTILES = [
@@ -67,7 +67,7 @@ QUANTILES = [
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 if torch.cuda.is_available():
-    pl_trainer_kwargs = {"accelerator": "gpu", "devices": 1}
+    pl_trainer_kwargs = {"accelerator": "gpu", "devices": [1]}
     logging.info("GPU detected. Using GPU for training.")
 else:
     pl_trainer_kwargs = {"accelerator": "cpu", "devices": 1}
