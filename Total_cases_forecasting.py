@@ -46,7 +46,7 @@ from darts.models import (
 # -----------------------------
 # USER-EDITABLE SETTINGS
 # -----------------------------
-RDS_PATH = "all_cases_12_Jan_2026.rds"   # <-- your file
+RDS_PATH = "all_cases_20_Jan_2026.rds"   # <-- your file
 OUT_DIR = "results"                     # <-- change if you want
 DATE_COL = "merged_date_min"            # <-- change if needed
 
