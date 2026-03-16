@@ -2,7 +2,7 @@
 # ------------------------------------------------------------
 # Rolling seasonal forecast for ONE season ending in December of Y (monthly)
 # Origins: Sep (Y-1) .. Aug (Y)  => horizons 15..4 months
-# Evaluate ALL leads (1..h) and save per-lead metrics (WIS, MAPE, etc.)
+# Evaluate ALL leads (1..h) and save per-lead metrics (standard WIS, MAPE, etc.)
 #
 # CLI usage:
 #   python Total_cases_forecasting.py ARIMA 2016
@@ -19,6 +19,14 @@
 #   - always calls predict(..., num_samples=NUM_SAMPLES)
 #   - requires forecast TimeSeries to have n_samples > 1
 #     (otherwise raises with a clear message)
+#
+# WIS implementation:
+#   - uses STANDARD central prediction intervals
+#   - interval score for alpha-central intervals:
+#         IS_alpha = (u - l)
+#                    + (2/alpha) * (l - y)   if y < l
+#                    + (2/alpha) * (y - u)   if y > u
+#   - WIS = [0.5 * |y - median| + sum_k (alpha_k/2) * IS_alpha_k] / (K + 0.5)
 # ------------------------------------------------------------
 
 import os
@@ -47,18 +55,28 @@ from darts.models import (
 # USER-EDITABLE SETTINGS
 # -----------------------------
 RDS_PATH = "all_cases_20_Jan_2026.rds"   # <-- your file
-OUT_DIR = "results"                     # <-- change if you want
-DATE_COL = "merged_date_min"            # <-- change if needed
+OUT_DIR = "results"                      # <-- change if you want
+DATE_COL = "merged_date_min"             # <-- change if needed
 
 # Probabilistic forecasting settings
-NUM_SAMPLES = 1000                      # <-- always used (enforced)
-MIN_TRAIN_MONTHS = 36                   # <-- minimum expanding-window history
-LAG_LENGTH_OVERRIDE = None              # <-- set int to force; else auto
+NUM_SAMPLES = 1000                       # <-- always used (enforced)
+MIN_TRAIN_MONTHS = 36                    # <-- minimum expanding-window history
+LAG_LENGTH_OVERRIDE = None               # <-- set int to force; else auto
 
-# Quantiles for WIS + output columns
+# Quantiles to save/output
 QUANTILES = [
     0.01, 0.025, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
     0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.975, 0.99
+]
+
+# Standard central intervals for WIS:
+# alpha = miscoverage rate, so interval is [alpha/2, 1 - alpha/2]
+# Examples:
+#   alpha=0.02 -> [0.01, 0.99]  (98% PI)
+#   alpha=0.05 -> [0.025, 0.975] (95% PI)
+#   alpha=0.10 -> [0.05, 0.95]   (90% PI)
+CENTRAL_INTERVAL_ALPHAS = [
+    0.02, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90
 ]
 
 # -----------------------------
@@ -135,40 +153,70 @@ def get_model(model_name: str, forecast_length: int, lag_length: int):
         raise ValueError(f"Unsupported model: {model_name}")
 
 # -----------------------------
-# WIS components
+# Helper to convert quantile to saved column name
+# -----------------------------
+def qcol(q: float) -> str:
+    return f"forecast_{int(round(q * 1000))}"
+
+# -----------------------------
+# Standard WIS components
 # -----------------------------
 def calculate_wis_components(row: pd.Series):
-    alphas = QUANTILES
-    y = row["actual"]
-    weight = 1
+    """
+    Standard weighted interval score (WIS), using:
+      WIS = [0.5*|y-m| + sum_k (alpha_k/2) * IS_alpha_k] / (K + 0.5)
 
-    wis_total = 0.0
+    where:
+      IS_alpha = (u - l)
+                 + (2/alpha)*(l - y) if y < l
+                 + (2/alpha)*(y - u) if y > u
+
+    Returns:
+      WIS_all       : standard normalized WIS
+      Sharpness     : normalized width-only contribution
+      Calibration   : normalized outside-interval penalty contribution
+      Bias          : directional bias summary based on central intervals
+    """
+    y = float(row["actual"])
+    median = float(row[qcol(0.50)])
+
+    K = len(CENTRAL_INTERVAL_ALPHAS)
+
+    median_component = 0.5 * abs(y - median)
     sharpness_total = 0.0
     calibration_total = 0.0
     below_count = 0
     above_count = 0
-    total_intervals = len(alphas) - 1
 
-    for i in range(total_intervals):
-        l = row[f"forecast_{int(alphas[i] * 1000)}"]
-        u = row[f"forecast_{int(alphas[i + 1] * 1000)}"]
-        alpha = alphas[i + 1] - alphas[i]
+    for alpha in CENTRAL_INTERVAL_ALPHAS:
+        lower_q = alpha / 2.0
+        upper_q = 1.0 - (alpha / 2.0)
 
-        sharpness = 0.5 * (u - l)
-        sharpness_total += sharpness
+        l = float(row[qcol(lower_q)])
+        u = float(row[qcol(upper_q)])
 
-        calibration = (2 / alpha) * max(0.0, l - y) + (2 / alpha) * max(0.0, y - u)
-        calibration_total += calibration
+        # Interval score decomposition
+        width = u - l
+        underprediction_penalty = (2.0 / alpha) * max(0.0, l - y)
+        overprediction_penalty = (2.0 / alpha) * max(0.0, y - u)
+        outside_penalty = underprediction_penalty + overprediction_penalty
 
-        wis_total += weight * (sharpness + calibration)
+        weight = alpha / 2.0
+
+        sharpness_total += weight * width
+        calibration_total += weight * outside_penalty
 
         if y < l:
             below_count += 1
         elif y > u:
             above_count += 1
 
-    bias = (below_count - above_count) / total_intervals
-    return wis_total, sharpness_total, calibration_total, bias
+    wis_total = (median_component + sharpness_total + calibration_total) / (K + 0.5)
+    sharpness_norm = sharpness_total / (K + 0.5)
+    calibration_norm = calibration_total / (K + 0.5)
+    bias = (below_count - above_count) / K
+
+    return wis_total, sharpness_norm, calibration_norm, bias
 
 # -----------------------------
 # Load RDS -> monthly series
@@ -224,7 +272,7 @@ def choose_lag_length(monthly_series: pd.Series) -> int:
     return max(4, min(12, n // 2))
 
 # -----------------------------
-# integer months between Periods
+# Integer months between Periods
 # end_p later than origin_p
 # -----------------------------
 def months_ahead(origin_p: pd.Period, end_p: pd.Period) -> int:
@@ -238,7 +286,7 @@ def predict_probabilistic(model, h: int) -> TimeSeries:
     fc = model.predict(h, num_samples=int(NUM_SAMPLES))
     n_samp = getattr(fc, "n_samples", 1)
 
-    # Fail fast if model did not return a stochastic forecast
+    # Failsafe
     if n_samp <= 1:
         raise RuntimeError(
             "Model forecast is deterministic (n_samples=1) even though num_samples was requested.\n"
@@ -295,7 +343,7 @@ def run_one_season_to_december(
 
         # --- probabilistic forecast (enforced) ---
         fc = predict_probabilistic(model, h)
-        # ----------------------------------------
+        # -----------------------------------------
 
         for k in range(1, h + 1):
             target_p = origin_p + k
@@ -318,7 +366,7 @@ def run_one_season_to_december(
 
             # Quantiles at lead k (index k-1)
             for q in QUANTILES:
-                entry[f"forecast_{int(q * 1000)}"] = float(fc.quantile(q).values()[k - 1, 0])
+                entry[qcol(q)] = float(fc.quantile(q).values()[k - 1, 0])
 
             rows.append(entry)
 
@@ -329,7 +377,7 @@ def run_one_season_to_december(
 
     df_fc = pd.DataFrame(rows)
     if df_fc.empty:
-        raise RuntimeError("No forecasts generated for this season (likely insufficient history).")
+        raise RuntimeError("No forecasts generated for this season (insufficient history).")
 
     # Metrics per target row
     df_fc[["WIS_all", "Sharpness", "Calibration", "Bias"]] = df_fc.apply(
@@ -337,7 +385,7 @@ def run_one_season_to_december(
     )
 
     # Point forecast (median)
-    yhat = df_fc["forecast_500"].astype(float)
+    yhat = df_fc[qcol(0.50)].astype(float)
     y = df_fc["actual"].astype(float)
     ae = (yhat - y).abs()
 
@@ -381,6 +429,7 @@ if __name__ == "__main__":
     lag_length = choose_lag_length(monthly_cases)
     logging.info(f"Using lag_length={lag_length} months")
     logging.info(f"Enforcing NUM_SAMPLES={NUM_SAMPLES} for probabilistic forecasts")
+    logging.info(f"Using standard WIS with {len(CENTRAL_INTERVAL_ALPHAS)} central prediction intervals")
 
     # Run the season
     df_fc = run_one_season_to_december(
