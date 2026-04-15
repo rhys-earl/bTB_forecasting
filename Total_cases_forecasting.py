@@ -1,32 +1,26 @@
-# Total_cases_forecasting.py
+# Total_cases_forecasting_v2.py
 # ------------------------------------------------------------
-# Rolling seasonal forecast for ONE season ending in December of Y (monthly)
-# Origins: Sep (Y-1) .. Aug (Y)  => horizons 15..4 months
-# Evaluate ALL leads (1..h) and save per-lead metrics (standard WIS, MAPE, etc.)
+# Rolling seasonal forecast aligned to R (fpp3) methodology.
 #
-# CLI usage:
-#   python Total_cases_forecasting.py ARIMA 2016
-#   python Total_cases_forecasting.py Prophet 2016
-#   python Total_cases_forecasting.py "Linear Regress" 2020
+# Structural changes
+#   1. Origin range: Sep (Y-1) -> Dec (Y), matching R exactly (16 origins per year)
+#   2. Max horizon:  16 months (from Sep Y-1 to Dec Y)
+#   3. Min horizon:  1 month  (origin = Dec Y, forecasting Jan Y+1 -- but we
+#                              filter to year Y only, so effective min = 1)
+#   4. Training data: expanding window up to but not including month_forecasting_from
+#   5. Annual total output: for each origin, monthly forecast samples are summed
+#                           over the target year only (Jan-Dec Y), then
+#                           lag_cumulative_observed_cases is added to EACH SAMPLE
+#                           PATH before quantiles are computed -- matching R's:
+#                           mutate(.sim = .sim + lag_cumulative_observed_cases)
 #
-# You only specify:
-#   1) model
-#   2) season_end_year (December year)
+# OUTPUT: one row per (origin x year_of_interest x model), giving an annual
+#         total forecast with quantiles + point stats -- directly comparable
+#         to the R output monthly_forecasts_all_months_just_year.
 #
-# Everything else is configured below as constants (easy to edit).
-#
-# This script ENFORCES probabilistic forecasts:
-#   - always calls predict(..., num_samples=NUM_SAMPLES)
-#   - requires forecast TimeSeries to have n_samples > 1
-#     (otherwise raises with a clear message)
-#
-# WIS implementation:
-#   - uses STANDARD central prediction intervals
-#   - interval score for alpha-central intervals:
-#         IS_alpha = (u - l)
-#                    + (2/alpha) * (l - y)   if y < l
-#                    + (2/alpha) * (y - u)   if y > u
-#   - WIS = [0.5 * |y - median| + sum_k (alpha_k/2) * IS_alpha_k] / (K + 0.5)
+# usage:
+#   python Total_cases_forecasting.py NHiTS 2016
+#   python Total_cases_forecasting.py TiDE 2018
 # ------------------------------------------------------------
 
 import os
@@ -54,30 +48,22 @@ from darts.models import (
 # -----------------------------
 # USER-EDITABLE SETTINGS
 # -----------------------------
-RDS_PATH = "all_cases_20_Jan_2026.rds"   # <-- your file
-OUT_DIR = "results"                      # <-- change if you want
-DATE_COL = "merged_date_min"             # <-- change if needed
+RDS_PATH      = "all_cases_20_Jan_2026.rds"
+OUT_DIR       = "results"
+DATE_COL      = "merged_date_min"
 
-# Probabilistic forecasting settings
-NUM_SAMPLES = 1000                       # <-- always used (enforced)
-MIN_TRAIN_MONTHS = 36                    # <-- minimum expanding-window history
-LAG_LENGTH_OVERRIDE = None               # <-- set int to force; else auto
+NUM_SAMPLES          = 1000  # sample paths -- matches R's times=1000
+MIN_TRAIN_MONTHS     = 1     # R has no minimum; set to 1 to match (was 36 in v1)
+INPUT_CHUNK_LENGTH   = 156   # fixed input window for all deep/regression models (weeks)
 
-# Quantiles to save/output
+# Quantiles to save -- richer than R's 80/95 only, but 80+95 are included
 QUANTILES = [
     0.01, 0.025, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
     0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.975, 0.99
 ]
 
-# Standard central intervals for WIS:
-# alpha = miscoverage rate, so interval is [alpha/2, 1 - alpha/2]
-# Examples:
-#   alpha=0.02 -> [0.01, 0.99]  (98% PI)
-#   alpha=0.05 -> [0.025, 0.975] (95% PI)
-#   alpha=0.10 -> [0.05, 0.95]   (90% PI)
-CENTRAL_INTERVAL_ALPHAS = [
-    0.02, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90
-]
+# Years to run -- matches R's years_to_explore = 2015:2025
+YEARS_TO_EXPLORE = list(range(2015, 2026))
 
 # -----------------------------
 # Logging + compute config
@@ -86,64 +72,37 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 
 if torch.cuda.is_available():
     pl_trainer_kwargs = {"accelerator": "gpu", "devices": [1]}
-    logging.info("GPU detected. Using GPU for training.")
+    logging.info("GPU detected.")
 else:
     pl_trainer_kwargs = {"accelerator": "cpu", "devices": 1}
-    logging.info("No GPU detected. Using CPU for training.")
+    logging.info("No GPU detected. Using CPU.")
 
 torch.set_num_threads(4)
 
 # -----------------------------
-# Model factory (monthly seasonality => season_length=12)
-# Deep models use QuantileRegression -> already probabilistic.
-# For stats models (Prophet/ARIMA/ETS), we still request num_samples at predict time.
+# Model factory
+# input_chunk_length is fixed at INPUT_CHUNK_LENGTH (156) for all models
 # -----------------------------
-def get_model(model_name: str, forecast_length: int, lag_length: int):
+def get_model(model_name: str, forecast_length: int):
     if model_name == "TiDE":
-        return TiDEModel(
-            input_chunk_length=lag_length,
-            output_chunk_length=forecast_length,
-            likelihood=QuantileRegression(quantiles=QUANTILES),
-            pl_trainer_kwargs=pl_trainer_kwargs,
-        )
+        return TiDEModel(input_chunk_length=INPUT_CHUNK_LENGTH, output_chunk_length=forecast_length,
+                         likelihood=QuantileRegression(quantiles=QUANTILES), pl_trainer_kwargs=pl_trainer_kwargs)
     elif model_name == "NBEATS":
-        return NBEATSModel(
-            input_chunk_length=lag_length,
-            output_chunk_length=forecast_length,
-            likelihood=QuantileRegression(quantiles=QUANTILES),
-            pl_trainer_kwargs=pl_trainer_kwargs,
-        )
+        return NBEATSModel(input_chunk_length=INPUT_CHUNK_LENGTH, output_chunk_length=forecast_length,
+                           likelihood=QuantileRegression(quantiles=QUANTILES), pl_trainer_kwargs=pl_trainer_kwargs)
     elif model_name == "NHiTS":
-        return NHiTSModel(
-            input_chunk_length=lag_length,
-            output_chunk_length=forecast_length,
-            likelihood=QuantileRegression(quantiles=QUANTILES),
-            pl_trainer_kwargs=pl_trainer_kwargs,
-        )
+        return NHiTSModel(input_chunk_length=INPUT_CHUNK_LENGTH, output_chunk_length=forecast_length,
+                          likelihood=QuantileRegression(quantiles=QUANTILES), pl_trainer_kwargs=pl_trainer_kwargs)
     elif model_name == "DLinear":
-        return DLinearModel(
-            input_chunk_length=lag_length,
-            output_chunk_length=forecast_length,
-            likelihood=QuantileRegression(quantiles=QUANTILES),
-            pl_trainer_kwargs=pl_trainer_kwargs,
-        )
+        return DLinearModel(input_chunk_length=INPUT_CHUNK_LENGTH, output_chunk_length=forecast_length,
+                            likelihood=QuantileRegression(quantiles=QUANTILES), pl_trainer_kwargs=pl_trainer_kwargs)
     elif model_name == "NLinear":
-        return NLinearModel(
-            input_chunk_length=lag_length,
-            output_chunk_length=forecast_length,
-            likelihood=QuantileRegression(quantiles=QUANTILES),
-            pl_trainer_kwargs=pl_trainer_kwargs,
-        )
+        return NLinearModel(input_chunk_length=INPUT_CHUNK_LENGTH, output_chunk_length=forecast_length,
+                            likelihood=QuantileRegression(quantiles=QUANTILES), pl_trainer_kwargs=pl_trainer_kwargs)
     elif model_name == "Linear Regress":
-        return LinearRegressionModel(
-            lags=lag_length,
-            output_chunk_length=forecast_length,
-            likelihood="quantile",
-            quantiles=QUANTILES,
-        )
+        return LinearRegressionModel(lags=INPUT_CHUNK_LENGTH, output_chunk_length=forecast_length,
+                                     likelihood="quantile", quantiles=QUANTILES)
     elif model_name == "Prophet":
-        # Note: probabilistic behaviour depends on Darts/Prophet backend;
-        # we enforce num_samples at predict time and fail if n_samples==1.
         return Prophet(yearly_seasonality=True)
     elif model_name == "ARIMA":
         return StatsForecastAutoARIMA(season_length=12)
@@ -152,324 +111,309 @@ def get_model(model_name: str, forecast_length: int, lag_length: int):
     else:
         raise ValueError(f"Unsupported model: {model_name}")
 
-# -----------------------------
-# Helper to convert quantile to saved column name
-# -----------------------------
+# Maps each quantile to its PI column name.
+# Symmetric pairs share a PI level; 0.50 is the median (no lower/upper).
+QUANTILE_TO_COL = {
+    0.01:  "pi_98_lower",
+    0.025: "pi_95_lower",
+    0.05:  "pi_90_lower",
+    0.10:  "pi_80_lower",
+    0.15:  "pi_70_lower",
+    0.20:  "pi_60_lower",
+    0.25:  "pi_50_lower",
+    0.30:  "pi_40_lower",
+    0.35:  "pi_30_lower",
+    0.40:  "pi_20_lower",
+    0.45:  "pi_10_lower",
+    0.50:  "pi_50",
+    0.55:  "pi_10_upper",
+    0.60:  "pi_20_upper",
+    0.65:  "pi_30_upper",
+    0.70:  "pi_40_upper",
+    0.75:  "pi_50_upper",
+    0.80:  "pi_60_upper",
+    0.85:  "pi_70_upper",
+    0.90:  "pi_80_upper",
+    0.95:  "pi_90_upper",
+    0.975: "pi_95_upper",
+    0.99:  "pi_98_upper",
+}
+
 def qcol(q: float) -> str:
-    return f"forecast_{int(round(q * 1000))}"
-
-# -----------------------------
-# Standard WIS components
-# -----------------------------
-def calculate_wis_components(row: pd.Series):
-    """
-    Standard weighted interval score (WIS), using:
-      WIS = [0.5*|y-m| + sum_k (alpha_k/2) * IS_alpha_k] / (K + 0.5)
-
-    where:
-      IS_alpha = (u - l)
-                 + (2/alpha)*(l - y) if y < l
-                 + (2/alpha)*(y - u) if y > u
-
-    Returns:
-      WIS_all       : standard normalized WIS
-      Sharpness     : normalized width-only contribution
-      Calibration   : normalized outside-interval penalty contribution
-      Bias          : directional bias summary based on central intervals
-    """
-    y = float(row["actual"])
-    median = float(row[qcol(0.50)])
-
-    K = len(CENTRAL_INTERVAL_ALPHAS)
-
-    median_component = 0.5 * abs(y - median)
-    sharpness_total = 0.0
-    calibration_total = 0.0
-    below_count = 0
-    above_count = 0
-
-    for alpha in CENTRAL_INTERVAL_ALPHAS:
-        lower_q = alpha / 2.0
-        upper_q = 1.0 - (alpha / 2.0)
-
-        l = float(row[qcol(lower_q)])
-        u = float(row[qcol(upper_q)])
-
-        # Interval score decomposition
-        width = u - l
-        underprediction_penalty = (2.0 / alpha) * max(0.0, l - y)
-        overprediction_penalty = (2.0 / alpha) * max(0.0, y - u)
-        outside_penalty = underprediction_penalty + overprediction_penalty
-
-        weight = alpha / 2.0
-
-        sharpness_total += weight * width
-        calibration_total += weight * outside_penalty
-
-        if y < l:
-            below_count += 1
-        elif y > u:
-            above_count += 1
-
-    wis_total = (median_component + sharpness_total + calibration_total) / (K + 0.5)
-    sharpness_norm = sharpness_total / (K + 0.5)
-    calibration_norm = calibration_total / (K + 0.5)
-    bias = (below_count - above_count) / K
-
-    return wis_total, sharpness_norm, calibration_norm, bias
+    return QUANTILE_TO_COL[q]
 
 # -----------------------------
 # Load RDS -> monthly series
-# Uses 'case' column if numeric; otherwise counts rows per month.
-# Missing months filled with 0.
 # -----------------------------
 def load_cases_monthly(rds_path: str, date_col: str) -> pd.Series:
     result = pyreadr.read_r(rds_path)
-    df = next(iter(result.values()))
+    df     = next(iter(result.values()))
 
     if date_col not in df.columns:
-        raise ValueError(
-            f"DATE_COL='{date_col}' not found in RDS. Available columns: {list(df.columns)}"
-        )
+        raise ValueError(f"DATE_COL='{date_col}' not found. Available: {list(df.columns)}")
 
     df[date_col] = pd.to_datetime(df[date_col])
-    df["month"] = df[date_col].dt.to_period("M").dt.to_timestamp()
+    df["month"]  = df[date_col].dt.to_period("M").dt.to_timestamp()
 
-    case_col = None
-    if "case" in df.columns:
-        s = pd.to_numeric(df["case"], errors="coerce")
-        if s.notna().any():
-            case_col = "case"
-
-    if case_col is not None:
-        monthly = df.groupby("month")[case_col].sum().astype(float)
-        logging.info("Using column 'case' and summing per month.")
+    if "case" in df.columns and pd.to_numeric(df["case"], errors="coerce").notna().any():
+        monthly = df.groupby("month")["case"].sum().astype(float)
+        logging.info("Using 'case' column, summing per month.")
     else:
         monthly = df.groupby("month").size().astype(float)
-        logging.info("No usable numeric 'case' column found; counting rows per month.")
+        logging.info("Counting rows per month.")
 
-    monthly = monthly.sort_index()
+    monthly  = monthly.sort_index()
     full_idx = pd.date_range(monthly.index.min(), monthly.index.max(), freq="MS")
-    monthly = monthly.reindex(full_idx, fill_value=0.0)
+    monthly  = monthly.reindex(full_idx, fill_value=0.0)
     monthly.index = pd.DatetimeIndex(monthly.index, freq="MS")
-    monthly.name = "cases"
+    monthly.name  = "cases"
     return monthly
 
 # -----------------------------
-# Auto lag length
-# -----------------------------
-def choose_lag_length(monthly_series: pd.Series) -> int:
-    if LAG_LENGTH_OVERRIDE is not None:
-        return int(LAG_LENGTH_OVERRIDE)
-
-    n = len(monthly_series)
-    if n >= 60:
-        return 24
-    if n >= 36:
-        return 18
-    if n >= 24:
-        return 12
-    return max(4, min(12, n // 2))
-
-# -----------------------------
-# Integer months between Periods
-# end_p later than origin_p
-# -----------------------------
-def months_ahead(origin_p: pd.Period, end_p: pd.Period) -> int:
-    return int(end_p.ordinal - origin_p.ordinal)
-
-# -----------------------------
-# Enforce probabilistic forecast output
+# Enforce probabilistic output
 # -----------------------------
 def predict_probabilistic(model, h: int) -> TimeSeries:
-    # Always request samples
-    fc = model.predict(h, num_samples=int(NUM_SAMPLES))
+    fc     = model.predict(h, num_samples=int(NUM_SAMPLES))
     n_samp = getattr(fc, "n_samples", 1)
-
-    # Failsafe
     if n_samp <= 1:
         raise RuntimeError(
-            "Model forecast is deterministic (n_samples=1) even though num_samples was requested.\n"
-            "This means quantiles/WIS are not valid for this model in this configuration.\n"
-            "Try a different model, or check Darts/Prophet/StatsForecast versions.\n"
-            f"Requested NUM_SAMPLES={NUM_SAMPLES}, got n_samples={n_samp}."
+            f"Model returned deterministic forecast (n_samples={n_samp}). "
+            f"Requested NUM_SAMPLES={NUM_SAMPLES}. Check model/Darts version."
         )
     return fc
 
 # -----------------------------
-# Seasonal rolling forecast for ONE season ending Dec of Y
+# Build the origins dataframe -- mirrors R's every_month_to_map_through_df
+#
+# For each year Y in YEARS_TO_EXPLORE:
+#   origins run Sep (Y-1) through Dec (Y)  [16 months, matching R]
+#   months_to_forecast = months from origin to Jan (Y+1)  [i.e. through Dec Y]
+#   lag_cumulative_observed_cases = observed cases Jan-Y up to (but not
+#     including) month_forecasting_from, 0 if origin is before Jan Y
+#
+# This replicates the R logic exactly:
+#   flag_last_12_rows, cumulative_observed_cases, lag_cumulative_observed_cases
 # -----------------------------
-def run_one_season_to_december(
-    series_pd: pd.Series,      # monthly, freq MS
-    model_name: str,
-    season_end_year: int,
-    lag_length: int,
-):
-    Y = int(season_end_year)
-    end_period = pd.Period(f"{Y}-12", freq="M")
-    last_target_ts = end_period.to_timestamp(how="start")
-
-    if last_target_ts not in series_pd.index:
-        raise ValueError(
-            f"Data does not include December {Y}. Last available month is {series_pd.index.max().date()}."
-        )
-
-    origin_start = pd.Period(f"{Y-1}-09", freq="M")
-    origin_end = pd.Period(f"{Y}-08", freq="M")
-    origin_periods = pd.period_range(origin_start, origin_end, freq="M")
-
+def build_origins_df(monthly_cases: pd.Series) -> pd.DataFrame:
     rows = []
+    for Y in YEARS_TO_EXPLORE:
+        # origins: Sep (Y-1) -> Dec (Y), step 1 month -- 16 origins
+        origin_start = pd.Timestamp(f"{Y-1}-09-01")
+        origin_end   = pd.Timestamp(f"{Y}-12-01")
+        origins      = pd.date_range(origin_start, origin_end, freq="MS")
 
-    for origin_p in origin_periods:
-        h = months_ahead(origin_p, end_period)  # int 15..4
-        if h <= 0:
-            continue
+        # Jan Y timestamp -- used to identify observed months within year Y
+        jan_y = pd.Timestamp(f"{Y}-01-01")
 
-        origin_ts = origin_p.to_timestamp(how="start")
-        if origin_ts not in series_pd.index:
-            continue
+        for origin_ts in origins:
+            # months_to_forecast: from origin to Dec Y (inclusive of Dec Y)
+            # = number of months between origin and Jan (Y+1)
+            jan_next = pd.Timestamp(f"{Y+1}-01-01")
+            months_to_forecast = (
+                (jan_next.year - origin_ts.year) * 12
+                + (jan_next.month - origin_ts.month)
+            )
 
-        train_slice = series_pd.loc[:origin_ts]
+            if months_to_forecast <= 0:
+                continue
 
-        if MIN_TRAIN_MONTHS is not None and len(train_slice) < MIN_TRAIN_MONTHS:
-            continue
-        if len(train_slice) < max(8, lag_length + 1):
+            # lag_cumulative_observed_cases:
+            # sum of observed cases in year Y from Jan up to (not including) origin
+            # mirrors R: lag(cumsum(cases * flag_last_12_rows))
+            if origin_ts <= jan_y:
+                # origin is before or at Jan Y -- no observed year-Y data yet
+                lag_cumulative = 0
+            else:
+                # observed months are Jan Y up to (but not including) origin_ts
+                obs_months = pd.date_range(jan_y, origin_ts - pd.DateOffset(months=1), freq="MS")
+                lag_cumulative = float(
+                    sum(monthly_cases.get(m, 0.0) for m in obs_months)
+                )
+
+            rows.append({
+                "month_forecasting_from":             origin_ts,
+                "year_of_interest":                   Y,
+                "months_to_forecast":                 months_to_forecast,
+                "lag_cumulative_observed_cases":      lag_cumulative,
+            })
+
+    df = pd.DataFrame(rows)
+    logging.info(f"Origins dataframe: {len(df)} rows across {len(YEARS_TO_EXPLORE)} years")
+    return df
+
+# -----------------------------
+# Core forecast function -- mirrors R's monthly_forecasts_function
+#
+# For each origin row:
+#   1. Train on all data BEFORE month_forecasting_from  (R: filter(year_month_date < month_forecasting_from))
+#   2. Forecast months_to_forecast steps ahead
+#   3. Extract the NUM_SAMPLES sample paths
+#   4. For each sample path, sum only the months falling in year_of_interest (Jan-Dec Y)
+#   5. Add lag_cumulative_observed_cases to EACH sample path  <-- key R logic
+#   6. Compute quantiles + summary stats across the adjusted sample paths
+# -----------------------------
+def run_annual_forecast(
+    monthly_cases: pd.Series,
+    model_name:    str,
+    origins_df:    pd.DataFrame,
+) -> pd.DataFrame:
+
+    all_rows = []
+
+    for _, row in origins_df.iterrows():
+        origin_ts          = row["month_forecasting_from"]
+        Y                  = int(row["year_of_interest"])
+        h                  = int(row["months_to_forecast"])
+        lag_cumulative     = float(row["lag_cumulative_observed_cases"])
+
+        # ------------------------------------------------------------------
+        # 1. Training slice: strictly BEFORE origin_ts  (mirrors R's <)
+        # ------------------------------------------------------------------
+        train_slice = monthly_cases.loc[monthly_cases.index < origin_ts]
+
+        # Deep/regression models need at least INPUT_CHUNK_LENGTH months of history.
+        # Stats models (ARIMA, ETS, Prophet) only need a small minimum.
+        stats_models = {"ARIMA", "ETS", "Prophet"}
+        min_train = 2 if model_name in stats_models else max(2, INPUT_CHUNK_LENGTH + 1)
+
+        if len(train_slice) < min_train:
+            logging.warning(f"Skipping origin {origin_ts.date()} Y={Y}: only {len(train_slice)} training months (need {min_train})")
             continue
 
         train_ts = TimeSeries.from_series(train_slice)
 
-        model = get_model(model_name=model_name, forecast_length=h, lag_length=lag_length)
+        # ------------------------------------------------------------------
+        # 2. Fit and forecast
+        # ------------------------------------------------------------------
+        model = get_model(model_name=model_name, forecast_length=h)
         model.fit(train_ts)
+        fc = predict_probabilistic(model, h)  # shape: (h, 1, NUM_SAMPLES)
 
-        # --- probabilistic forecast (enforced) ---
-        fc = predict_probabilistic(model, h)
-        # -----------------------------------------
+        # ------------------------------------------------------------------
+        # 3. Build a DataFrame of sample paths: rows=months, cols=samples
+        #    Attach the actual forecast timestamps
+        # ------------------------------------------------------------------
+        # fc.all_values() shape: (h, 1, NUM_SAMPLES)
+        samples_matrix = fc.all_values()[:, 0, :]  # shape: (h, NUM_SAMPLES)
 
-        for k in range(1, h + 1):
-            target_p = origin_p + k
-            target_ts = target_p.to_timestamp(how="start")
-            y_true = float(series_pd.loc[target_ts])
+        # Forecast timestamps (start of each forecast month)
+        forecast_timestamps = pd.date_range(origin_ts, periods=h, freq="MS")
 
-            entry = {
-                "season_end_year": Y,
-                "origin_year": int(origin_p.year),
-                "origin_month": int(origin_p.month),
-                "origin_timestamp": origin_ts,
-                "target_timestamp": target_ts,
-                "lead": k,
-                "horizon": int(h),
-                "actual": y_true,
-                "model": model_name,
-                "lag_length": lag_length,
-                "num_samples": int(NUM_SAMPLES),
-            }
-
-            # Quantiles at lead k (index k-1)
-            for q in QUANTILES:
-                entry[qcol(q)] = float(fc.quantile(q).values()[k - 1, 0])
-
-            rows.append(entry)
-
-        logging.info(
-            f"Origin {origin_p} -> Dec {Y}: horizon={h}, "
-            f"trained on {train_slice.index.min().date()}..{train_slice.index.max().date()} ({len(train_slice)} months)"
+        fc_df = pd.DataFrame(
+            samples_matrix,
+            index=forecast_timestamps,
+            columns=[f"s{i}" for i in range(NUM_SAMPLES)]
         )
 
-    df_fc = pd.DataFrame(rows)
-    if df_fc.empty:
-        raise RuntimeError("No forecasts generated for this season (insufficient history).")
+        # ------------------------------------------------------------------
+        # 4. Filter to year_of_interest only (Jan-Dec Y)
+        #    Mirrors R: filter(year == year_of_interest_only)
+        # ------------------------------------------------------------------
+        fc_year = fc_df[fc_df.index.year == Y]
 
-    # Metrics per target row
-    df_fc[["WIS_all", "Sharpness", "Calibration", "Bias"]] = df_fc.apply(
-        calculate_wis_components, axis=1, result_type="expand"
-    )
+        if fc_year.empty:
+            logging.warning(f"No forecast months fall in year {Y} for origin {origin_ts.date()}")
+            continue
 
-    # Point forecast (median)
-    yhat = df_fc[qcol(0.50)].astype(float)
-    y = df_fc["actual"].astype(float)
-    ae = (yhat - y).abs()
+        # ------------------------------------------------------------------
+        # 5. Sum across the year for each sample path -> shape: (NUM_SAMPLES,)
+        #    Then add lag_cumulative_observed_cases to EACH sample path
+        #    Mirrors R: summarise(.sim = sum(.sim)) then
+        #               mutate(.sim = .sim + lag_cumulative_observed_cases)
+        # ------------------------------------------------------------------
+        annual_samples = fc_year.sum(axis=0).values  # (NUM_SAMPLES,)
+        annual_samples_adjusted = annual_samples + lag_cumulative  # key step
 
-    df_fc["AE"] = ae
-    df_fc["SE"] = (yhat - y) ** 2
+        # ------------------------------------------------------------------
+        # 6. Compute quantiles from the adjusted sample paths
+        #    (intervals now correctly reflect uncertainty around annual total)
+        # ------------------------------------------------------------------
+        quantile_vals = {qcol(q): float(np.quantile(annual_samples_adjusted, q)) for q in QUANTILES}
 
-    df_fc["MAPE"] = np.where(y != 0, (ae / np.abs(y)) * 100.0, np.nan)
-    denom = (np.abs(y) + np.abs(yhat))
-    df_fc["sMAPE"] = np.where(denom != 0, (2.0 * ae / denom) * 100.0, np.nan)
+        mean_val   = float(np.mean(annual_samples_adjusted))
+        median_val = float(np.median(annual_samples_adjusted))
 
-    df_fc["wMAPE_num"] = ae
-    df_fc["wMAPE_den"] = np.abs(y)
+        # All quantile columns are named pi_* (e.g. pi_95_lower, pi_95_upper,
+        # pi_80_lower, pi_80_upper, pi_50 etc.) via QUANTILE_TO_COL mapping.
+        # No separate formatted string columns needed -- naming is self-describing.
+        result_row = {
+            "mean":                               mean_val,
+            "median":                             median_val,
+            "month_forecasting_from":             origin_ts,
+            "year_of_interest_plus_prev_months":  Y,
+            "model":                              model_name,
+            **quantile_vals,
+            "months_to_forecast":                 h,
+            "number_of_months_to_forecast":       f"{h} months",
+        }
 
-    return df_fc
+        all_rows.append(result_row)
+        logging.info(
+            f"Origin {origin_ts.date()} -> Y={Y}: h={h}, "
+            f"obs_carried={lag_cumulative:,.0f}, "
+            f"mean={mean_val:,.0f}, "
+            f"train_n={len(train_slice)}"
+        )
+
+    df_out = pd.DataFrame(all_rows)
+    if df_out.empty:
+        raise RuntimeError("No forecasts generated.")
+
+    return df_out
 
 # -----------------------------
 # Main
 # -----------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Seasonal rolling probabilistic forecast for ONE season ending in Dec of year Y."
+        description=(
+            "Annual total forecast aligned to R fpp3 methodology. "
+            "Origins: Sep(Y-1) to Dec(Y). "
+            "Observed months Jan-to-origin are added to each sample path before quantiles."
+        )
     )
     parser.add_argument(
         "model",
         type=str,
-        help='Model name: TiDE, NBEATS, NHiTS, DLinear, NLinear, Prophet, ARIMA, ETS, "Linear Regress"',
+        help='Model: TiDE, NBEATS, NHiTS, DLinear, NLinear, Prophet, ARIMA, ETS, "Linear Regress"',
     )
     parser.add_argument(
         "season_end_year",
         type=int,
-        help="December year Y. Runs origins Sep (Y-1) .. Aug (Y), forecasting to Dec Y.",
+        nargs="?",
+        default=None,
+        help=(
+            "Optional: run a single year only (e.g. 2016). "
+            "If omitted, runs all years in YEARS_TO_EXPLORE."
+        ),
     )
     args = parser.parse_args()
 
-    # Load monthly cases
+    # Optionally restrict to a single year
+    if args.season_end_year is not None:
+        YEARS_TO_EXPLORE[:] = [args.season_end_year]
+
+    # Load data
     monthly_cases = load_cases_monthly(RDS_PATH, DATE_COL)
-    logging.info(f"Monthly series spans {monthly_cases.index.min().date()} to {monthly_cases.index.max().date()}")
-    logging.info(f"Total months: {len(monthly_cases)}")
+    logging.info(f"Series: {monthly_cases.index.min().date()} to {monthly_cases.index.max().date()} ({len(monthly_cases)} months)")
+    logging.info(f"INPUT_CHUNK_LENGTH={INPUT_CHUNK_LENGTH}, NUM_SAMPLES={NUM_SAMPLES}")
 
-    # Choose lag length automatically (unless overridden)
-    lag_length = choose_lag_length(monthly_cases)
-    logging.info(f"Using lag_length={lag_length} months")
-    logging.info(f"Enforcing NUM_SAMPLES={NUM_SAMPLES} for probabilistic forecasts")
-    logging.info(f"Using standard WIS with {len(CENTRAL_INTERVAL_ALPHAS)} central prediction intervals")
+    # Build origins (mirrors every_month_to_map_through_df in R)
+    origins_df = build_origins_df(monthly_cases)
 
-    # Run the season
-    df_fc = run_one_season_to_december(
-        series_pd=monthly_cases,
+    # Run forecasts
+    df_out = run_annual_forecast(
+        monthly_cases=monthly_cases,
         model_name=args.model,
-        season_end_year=args.season_end_year,
-        lag_length=lag_length,
+        origins_df=origins_df,
     )
 
-    # Output paths
+    # Save
     out_dir = os.path.join(OUT_DIR, args.model.replace(" ", "_"))
     os.makedirs(out_dir, exist_ok=True)
 
-    detailed_path = os.path.join(
-        out_dir,
-        f"seasonal_rolling{args.season_end_year}.csv"
-    )
-    df_fc.to_csv(detailed_path, index=False)
-    logging.info(f"Saved detailed results: {detailed_path}")
-
-    # Summary: by origin_month and lead for this one season
-    summary = df_fc.groupby(["origin_month", "lead"]).agg(
-        n=("actual", "count"),
-        mean_WIS=("WIS_all", "mean"),
-        mean_AE=("AE", "mean"),
-        mean_MAPE=("MAPE", "mean"),
-        mean_sMAPE=("sMAPE", "mean"),
-        wMAPE_num=("wMAPE_num", "sum"),
-        wMAPE_den=("wMAPE_den", "sum"),
-    ).reset_index()
-
-    summary["wMAPE_pct"] = np.where(
-        summary["wMAPE_den"] != 0, (summary["wMAPE_num"] / summary["wMAPE_den"]) * 100.0, np.nan
-    )
-
-    summary_path = os.path.join(
-        out_dir,
-        f"seasonal_summary_{args.season_end_year}.csv"
-    )
-    summary.to_csv(summary_path, index=False)
-    logging.info(f"Saved summary results: {summary_path}")
-
+    year_tag = str(args.season_end_year) if args.season_end_year else "all_years"
+    out_path = os.path.join(out_dir, f"annual_total_forecast_{year_tag}.csv")
+    df_out.to_csv(out_path, index=False)
+    logging.info(f"Saved: {out_path}  ({len(df_out)} rows)")
     logging.info("Done.")
