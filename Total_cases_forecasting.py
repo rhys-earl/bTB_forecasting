@@ -2,12 +2,13 @@
 # ------------------------------------------------------------
 # Rolling seasonal forecast aligned to R (fpp3) methodology.
 #
-# Structural changes
+# KEY CHANGES FROM v1:
 #   1. Origin range: Sep (Y-1) -> Dec (Y), matching R exactly (16 origins per year)
 #   2. Max horizon:  16 months (from Sep Y-1 to Dec Y)
 #   3. Min horizon:  1 month  (origin = Dec Y, forecasting Jan Y+1 -- but we
 #                              filter to year Y only, so effective min = 1)
-#   4. Training data: expanding window up to but not including month_forecasting_from
+#   4. Training data: expanding window up to but NOT including month_forecasting_from
+#                     (R does: filter(year_month_date < month_forecasting_from))
 #   5. Annual total output: for each origin, monthly forecast samples are summed
 #                           over the target year only (Jan-Dec Y), then
 #                           lag_cumulative_observed_cases is added to EACH SAMPLE
@@ -18,9 +19,10 @@
 #         total forecast with quantiles + point stats -- directly comparable
 #         to the R output monthly_forecasts_all_months_just_year.
 #
-# usage:
-#   python Total_cases_forecasting.py NHiTS 2016
-#   python Total_cases_forecasting.py TiDE 2018
+# CLI usage:
+#   python Total_cases_forecasting_v2.py ARIMA 2016
+#   python Total_cases_forecasting_v2.py ETS 2020
+#   python Total_cases_forecasting_v2.py Prophet 2018
 # ------------------------------------------------------------
 
 import os
@@ -34,7 +36,7 @@ import torch
 from darts import TimeSeries
 from darts.utils.likelihood_models import QuantileRegression
 from darts.models import (
-    StatsForecastAutoARIMA,
+    AutoARIMA,
     Prophet,
     DLinearModel,
     NLinearModel,
@@ -42,7 +44,7 @@ from darts.models import (
     NHiTSModel,
     NBEATSModel,
     LinearRegressionModel,
-    StatsForecastAutoETS,
+    AutoETS,
 )
 
 # -----------------------------
@@ -105,9 +107,9 @@ def get_model(model_name: str, forecast_length: int):
     elif model_name == "Prophet":
         return Prophet(yearly_seasonality=True)
     elif model_name == "ARIMA":
-        return StatsForecastAutoARIMA(season_length=12)
+        return AutoARIMA(season_length=12)
     elif model_name == "ETS":
-        return StatsForecastAutoETS(season_length=12)
+        return AutoETS(season_length=12)
     else:
         raise ValueError(f"Unsupported model: {model_name}")
 
