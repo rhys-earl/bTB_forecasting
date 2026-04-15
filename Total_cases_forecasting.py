@@ -415,7 +415,7 @@ if __name__ == "__main__":
     os.makedirs(out_dir, exist_ok=True)
 
     year_tag = str(args.season_end_year) if args.season_end_year else "all_years"
-    out_path = os.path.join(out_dir, f"annual_total_forecast_{year_tag}.csv")
+    out_path = os.path.join(out_dir, f"{args.model}annual_total_forecast_{year_tag}.csv")
     df_out.to_csv(out_path, index=False)
     logging.info(f"Saved: {out_path}  ({len(df_out)} rows)")
     logging.info("Done.")
