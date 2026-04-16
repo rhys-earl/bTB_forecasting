@@ -56,7 +56,7 @@ DATE_COL      = "merged_date_min"
 
 NUM_SAMPLES          = 1000  # sample paths -- matches R's times=1000
 MIN_TRAIN_MONTHS     = 1     # R has no minimum; set to 1 to match (was 36 in v1)
-INPUT_CHUNK_LENGTH   = 104   # fixed input window for all deep/regression models (weeks)
+INPUT_CHUNK_LENGTH   = 36   # fixed input window for all deep/regression models (weeks)
 
 # Quantiles to save -- richer than R's 80/95 only, but 80+95 are included
 QUANTILES = [
