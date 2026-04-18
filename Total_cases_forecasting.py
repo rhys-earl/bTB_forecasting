@@ -15,14 +15,22 @@
 #                           PATH before quantiles are computed -- matching R's:
 #                           mutate(.sim = .sim + lag_cumulative_observed_cases)
 #
+# TRANSFORMATIONS (added):
+#   Optional transformation applied to training data before fitting and inverted
+#   on the forecast TimeSeries BEFORE sample extraction, so all annual summing,
+#   lag-cumulative addition, and quantile computation remain on the original scale.
+#   Options: none (default), log1p, scaler (min-max), boxcox
+#   CLI: --transformation log1p
+#
 # OUTPUT: one row per (origin x year_of_interest x model), giving an annual
 #         total forecast with quantiles + point stats -- directly comparable
 #         to the R output monthly_forecasts_all_months_just_year.
 #
 # CLI usage:
 #   python Total_cases_forecasting_v2.py ARIMA 2016
-#   python Total_cases_forecasting_v2.py ETS 2020
-#   python Total_cases_forecasting_v2.py Prophet 2018
+#   python Total_cases_forecasting_v2.py ETS 2020 --transformation log1p
+#   python Total_cases_forecasting_v2.py Prophet 2018 --transformation scaler
+#   python Total_cases_forecasting_v2.py ARIMA 2016 --transformation boxcox
 # ------------------------------------------------------------
 
 import os
@@ -34,6 +42,7 @@ import pyreadr
 
 import torch
 from darts import TimeSeries
+from darts.dataprocessing.transformers import BoxCox, Scaler
 from darts.utils.likelihood_models import QuantileRegression
 from darts.models import (
     AutoARIMA,
@@ -73,7 +82,7 @@ YEARS_TO_EXPLORE = list(range(2015, 2026))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 if torch.cuda.is_available():
-    pl_trainer_kwargs = {"accelerator": "gpu", "devices": [1]}
+    pl_trainer_kwargs = {"accelerator": "gpu", "devices": [2]}
     logging.info("GPU detected.")
 else:
     pl_trainer_kwargs = {"accelerator": "cpu", "devices": 1}
@@ -83,7 +92,7 @@ torch.set_num_threads(4)
 
 # -----------------------------
 # Model factory
-# input_chunk_length is fixed at INPUT_CHUNK_LENGTH (156) for all models
+# input_chunk_length is fixed at INPUT_CHUNK_LENGTH for all models
 # -----------------------------
 def get_model(model_name: str, forecast_length: int):
     if model_name == "TiDE":
@@ -143,6 +152,82 @@ QUANTILE_TO_COL = {
 
 def qcol(q: float) -> str:
     return QUANTILE_TO_COL[q]
+
+# -----------------------------
+# Transformation helpers
+# Mirrors the apply/invert pattern from regional_univariate.py.
+# Inversion is called on the full probabilistic TimeSeries BEFORE sample
+# extraction, so all downstream math (annual sum, lag addition, quantiles)
+# stays on the original case-count scale.
+# -----------------------------
+def apply_transformation(
+    train_series: TimeSeries,
+    transformation: str,
+):
+    """
+    Apply transformation to training series before model fitting.
+
+    Returns (transformed_series, transformer_object).
+    transformer_object is passed to invert_transformation after forecasting.
+
+    Options:
+        none    -- no-op, returns series unchanged
+        log1p   -- np.log1p applied element-wise (handles zeros; requires values > -1)
+        scaler  -- Darts Scaler (min-max normalisation)
+        boxcox  -- Darts BoxCox (requires strictly positive values)
+    """
+    if transformation == "none":
+        return train_series, None
+
+    if transformation == "log1p":
+        vals = train_series.values(copy=False).reshape(-1)
+        if np.any(vals <= -1):
+            raise ValueError("log1p requires all values > -1")
+        df = train_series.to_dataframe()
+        df = df.apply(np.log1p)
+        transformed = TimeSeries.from_dataframe(df)
+        return transformed, "log1p"
+
+    if transformation == "scaler":
+        t = Scaler()
+        return t.fit_transform(train_series), t
+
+    if transformation == "boxcox":
+        vals = train_series.values(copy=False).reshape(-1)
+        if np.any(vals <= 0):
+            raise ValueError("BoxCox requires strictly positive values")
+        t = BoxCox()
+        return t.fit_transform(train_series), t
+
+    raise ValueError(
+        f"Unknown transformation: '{transformation}'. "
+        f"Choose from: none, log1p, scaler, boxcox"
+    )
+
+
+def invert_transformation(
+    forecast_series: TimeSeries,
+    transformer,
+) -> TimeSeries:
+    """
+    Invert transformation on a probabilistic forecast TimeSeries.
+
+    Uses all_values() for log1p so every sample path is back-transformed
+    correctly, preserving the full distribution shape.
+    """
+    if transformer is None:
+        return forecast_series
+
+    if transformer == "log1p":
+        all_vals = forecast_series.all_values(copy=False)  # (h, 1, NUM_SAMPLES)
+        back = np.expm1(all_vals)
+        return TimeSeries.from_times_and_values(
+            times=forecast_series.time_index,
+            values=back,
+            columns=forecast_series.components,
+        )
+
+    return transformer.inverse_transform(forecast_series)
 
 # -----------------------------
 # Load RDS -> monthly series
@@ -248,16 +333,21 @@ def build_origins_df(monthly_cases: pd.Series) -> pd.DataFrame:
 #
 # For each origin row:
 #   1. Train on all data BEFORE month_forecasting_from  (R: filter(year_month_date < month_forecasting_from))
-#   2. Forecast months_to_forecast steps ahead
-#   3. Extract the NUM_SAMPLES sample paths
-#   4. For each sample path, sum only the months falling in year_of_interest (Jan-Dec Y)
-#   5. Add lag_cumulative_observed_cases to EACH sample path  <-- key R logic
-#   6. Compute quantiles + summary stats across the adjusted sample paths
+#   2. Apply transformation to training series
+#   3. Fit model on transformed series
+#   4. Forecast months_to_forecast steps ahead (in transformed space)
+#   5. Invert transformation on the full probabilistic TimeSeries
+#      (BEFORE sample extraction -- keeps all downstream math on original scale)
+#   6. Extract the NUM_SAMPLES sample paths
+#   7. For each sample path, sum only the months falling in year_of_interest (Jan-Dec Y)
+#   8. Add lag_cumulative_observed_cases to EACH sample path  <-- key R logic
+#   9. Compute quantiles + summary stats across the adjusted sample paths
 # -----------------------------
 def run_annual_forecast(
-    monthly_cases: pd.Series,
-    model_name:    str,
-    origins_df:    pd.DataFrame,
+    monthly_cases:  pd.Series,
+    model_name:     str,
+    origins_df:     pd.DataFrame,
+    transformation: str = "none",
 ) -> pd.DataFrame:
 
     all_rows = []
@@ -285,11 +375,19 @@ def run_annual_forecast(
         train_ts = TimeSeries.from_series(train_slice)
 
         # ------------------------------------------------------------------
-        # 2. Fit and forecast
+        # 2. Apply transformation, fit, forecast, then invert transformation
+        #    Inversion happens on the full TimeSeries BEFORE sample extraction
+        #    so all downstream math (annual sum, lag addition, quantiles)
+        #    operates on the original case-count scale.
         # ------------------------------------------------------------------
+        train_t, transformer = apply_transformation(train_ts, transformation)
+
         model = get_model(model_name=model_name, forecast_length=h)
-        model.fit(train_ts)
-        fc = predict_probabilistic(model, h)  # shape: (h, 1, NUM_SAMPLES)
+        model.fit(train_t)
+        fc = predict_probabilistic(model, h)  # shape: (h, 1, NUM_SAMPLES) in transformed space
+
+        # Invert BEFORE extracting the sample matrix
+        fc = invert_transformation(fc, transformer)
 
         # ------------------------------------------------------------------
         # 3. Build a DataFrame of sample paths: rows=months, cols=samples
@@ -335,15 +433,13 @@ def run_annual_forecast(
         mean_val   = float(np.mean(annual_samples_adjusted))
         median_val = float(np.median(annual_samples_adjusted))
 
-        # All quantile columns are named pi_* (e.g. pi_95_lower, pi_95_upper,
-        # pi_80_lower, pi_80_upper, pi_50 etc.) via QUANTILE_TO_COL mapping.
-        # No separate formatted string columns needed -- naming is self-describing.
         result_row = {
             "mean":                               mean_val,
             "median":                             median_val,
             "month_forecasting_from":             origin_ts,
             "year_of_interest_plus_prev_months":  Y,
             "model":                              model_name,
+            "transformation":                     transformation,
             **quantile_vals,
             "months_to_forecast":                 h,
             "number_of_months_to_forecast":       f"{h} months",
@@ -352,6 +448,7 @@ def run_annual_forecast(
         all_rows.append(result_row)
         logging.info(
             f"Origin {origin_ts.date()} -> Y={Y}: h={h}, "
+            f"transform={transformation}, "
             f"obs_carried={lag_cumulative:,.0f}, "
             f"mean={mean_val:,.0f}, "
             f"train_n={len(train_slice)}"
@@ -389,6 +486,18 @@ if __name__ == "__main__":
             "If omitted, runs all years in YEARS_TO_EXPLORE."
         ),
     )
+    parser.add_argument(
+        "--transformation",
+        type=str,
+        default="none",
+        choices=["none", "log1p", "scaler", "boxcox"],
+        help=(
+            "Transformation applied to training data before fitting, "
+            "inverted on the forecast before sample extraction. "
+            "Options: none (default), log1p, scaler (min-max), boxcox. "
+            "Example: --transformation log1p"
+        ),
+    )
     args = parser.parse_args()
 
     # Optionally restrict to a single year
@@ -398,7 +507,7 @@ if __name__ == "__main__":
     # Load data
     monthly_cases = load_cases_monthly(RDS_PATH, DATE_COL)
     logging.info(f"Series: {monthly_cases.index.min().date()} to {monthly_cases.index.max().date()} ({len(monthly_cases)} months)")
-    logging.info(f"INPUT_CHUNK_LENGTH={INPUT_CHUNK_LENGTH}, NUM_SAMPLES={NUM_SAMPLES}")
+    logging.info(f"INPUT_CHUNK_LENGTH={INPUT_CHUNK_LENGTH}, NUM_SAMPLES={NUM_SAMPLES}, transformation={args.transformation}")
 
     # Build origins (mirrors every_month_to_map_through_df in R)
     origins_df = build_origins_df(monthly_cases)
@@ -408,14 +517,18 @@ if __name__ == "__main__":
         monthly_cases=monthly_cases,
         model_name=args.model,
         origins_df=origins_df,
+        transformation=args.transformation,
     )
 
-    # Save
+    # Save -- transformation name included in filename so runs don't overwrite each other
     out_dir = os.path.join(OUT_DIR, args.model.replace(" ", "_"))
     os.makedirs(out_dir, exist_ok=True)
 
     year_tag = str(args.season_end_year) if args.season_end_year else "all_years"
-    out_path = os.path.join(out_dir, f"{args.model}annual_total_forecast_{year_tag}.csv")
+    out_path = os.path.join(
+        out_dir,
+        f"{args.model}_transform_{args.transformation}_annual_total_forecast_{year_tag}.csv"
+    )
     df_out.to_csv(out_path, index=False)
     logging.info(f"Saved: {out_path}  ({len(df_out)} rows)")
     logging.info("Done.")
