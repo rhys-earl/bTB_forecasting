@@ -37,14 +37,24 @@
 #
 #      This matches Jamie's steps 1-6 exactly and applies to ALL model types.
 #
+# TRANSFORMATIONS (added):
+#   Optional transformation applied to training data before fitting.
+#   The point forecast and historical forecasts (used for residuals) are both
+#   inverted back to the original scale BEFORE residuals are computed and
+#   before the bootstrap runs -- so all annual summing, lag-cumulative
+#   addition, and quantile computation remain on the original case-count scale.
+#   Options: none (default), log1p, scaler (min-max), boxcox
+#   CLI: --transformation log1p
+#
 # OUTPUT: one row per (origin x year_of_interest x model), giving an annual
 #         total forecast with quantiles + point stats -- directly comparable
 #         to the R output monthly_forecasts_all_months_just_year.
 #
 # CLI usage:
 #   python Total_cases_forecasting_v2.py ARIMA 2016
-#   python Total_cases_forecasting_v2.py ETS 2020
-#   python Total_cases_forecasting_v2.py Prophet 2018
+#   python Total_cases_forecasting_v2.py ETS 2020 --transformation log1p
+#   python Total_cases_forecasting_v2.py Prophet 2018 --transformation scaler
+#   python Total_cases_forecasting_v2.py ARIMA 2016 --transformation boxcox
 # ------------------------------------------------------------
 
 import os
@@ -56,6 +66,7 @@ import pyreadr
 
 import torch
 from darts import TimeSeries
+from darts.dataprocessing.transformers import BoxCox, Scaler
 from darts.models import (
     AutoARIMA,
     Prophet,
@@ -188,6 +199,85 @@ def qcol(q: float) -> str:
 
 
 # -----------------------------
+# Transformation helpers
+#
+# Transformation is applied to training data before fitting.
+# Both the point forecast AND the historical forecasts used for residual
+# computation are inverted back to the original scale before any arithmetic,
+# so residuals, bootstrap paths, annual sums, and quantiles all stay on the
+# original case-count scale.
+# -----------------------------
+def apply_transformation(
+    train_series: TimeSeries,
+    transformation: str,
+):
+    """
+    Apply transformation to training series before model fitting.
+
+    Returns (transformed_series, transformer_object).
+    transformer_object is passed to invert_transformation after forecasting.
+
+    Options:
+        none    -- no-op, returns series unchanged
+        log1p   -- np.log1p applied element-wise (handles zeros; requires values > -1)
+        scaler  -- Darts Scaler (min-max normalisation)
+        boxcox  -- Darts BoxCox (requires strictly positive values)
+    """
+    if transformation == "none":
+        return train_series, None
+
+    if transformation == "log1p":
+        vals = train_series.values(copy=False).reshape(-1)
+        if np.any(vals <= -1):
+            raise ValueError("log1p requires all values > -1")
+        df = train_series.to_dataframe()
+        df = df.apply(np.log1p)
+        transformed = TimeSeries.from_dataframe(df)
+        return transformed, "log1p"
+
+    if transformation == "scaler":
+        t = Scaler()
+        return t.fit_transform(train_series), t
+
+    if transformation == "boxcox":
+        vals = train_series.values(copy=False).reshape(-1)
+        if np.any(vals <= 0):
+            raise ValueError("BoxCox requires strictly positive values")
+        t = BoxCox()
+        return t.fit_transform(train_series), t
+
+    raise ValueError(
+        f"Unknown transformation: '{transformation}'. "
+        f"Choose from: none, log1p, scaler, boxcox"
+    )
+
+
+def invert_transformation(
+    forecast_series: TimeSeries,
+    transformer,
+) -> TimeSeries:
+    """
+    Invert transformation on a TimeSeries (point forecast or historical forecasts).
+
+    Uses all_values() for log1p so every sample is back-transformed correctly.
+    For scaler/boxcox, delegates to the fitted transformer's inverse_transform.
+    """
+    if transformer is None:
+        return forecast_series
+
+    if transformer == "log1p":
+        all_vals = forecast_series.all_values(copy=False)  # (h, 1, n_samples)
+        back = np.expm1(all_vals)
+        return TimeSeries.from_times_and_values(
+            times=forecast_series.time_index,
+            values=back,
+            columns=forecast_series.components,
+        )
+
+    return transformer.inverse_transform(forecast_series)
+
+
+# -----------------------------
 # Load RDS -> monthly series
 # -----------------------------
 def load_cases_monthly(rds_path: str, date_col: str) -> pd.Series:
@@ -220,7 +310,14 @@ def load_cases_monthly(rds_path: str, date_col: str) -> pd.Series:
 #
 # Uses Darts historical_forecasts() with retrain=False to get 1-step-ahead
 # point predictions across the training series after the model has been fitted.
-# residual = actual - predicted at each step.
+#
+# IMPORTANT: historical_forecasts are run on the TRANSFORMED series (train_t),
+# then inverted back to the original scale before computing residuals.
+# Actual values are taken from the ORIGINAL train_ts (not transformed).
+# This means residuals are always on the original case-count scale, which is
+# what the bootstrap needs.
+#
+# residual = actual_original - predicted_original at each in-sample step.
 #
 # For stats models (ARIMA, ETS, Prophet): burn-in of 12 months.
 # For deep learning models: burn-in of INPUT_CHUNK_LENGTH months so the model
@@ -230,8 +327,10 @@ def load_cases_monthly(rds_path: str, date_col: str) -> pd.Series:
 # -----------------------------
 def compute_residuals(
     model,
-    train_ts:   TimeSeries,
-    model_name: str,
+    train_ts:    TimeSeries,
+    train_t:     TimeSeries,
+    transformer,
+    model_name:  str,
 ) -> np.ndarray | None:
 
     stats_models = {"ARIMA", "ETS", "Prophet"}
@@ -241,8 +340,9 @@ def compute_residuals(
         return None
 
     try:
-        hf = model.historical_forecasts(
-            series=train_ts,
+        # Historical forecasts on the transformed series
+        hf_t = model.historical_forecasts(
+            series=train_t,
             start=burn_in,
             start_format="position",
             forecast_horizon=1,
@@ -253,10 +353,15 @@ def compute_residuals(
             num_samples=1,
             verbose=False,
         )
-        predicted  = hf.values().flatten()
-        actual_ts  = train_ts.slice_intersect(hf)
-        actual     = actual_ts.values().flatten()
-        residuals  = actual - predicted
+
+        # Invert to original scale before computing residuals
+        hf = invert_transformation(hf_t, transformer)
+
+        # Actual values on original scale, sliced to match the forecast index
+        actual_ts = train_ts.slice_intersect(hf)
+        actual    = actual_ts.values().flatten()
+        predicted = hf.values().flatten()
+        residuals = actual - predicted
 
         if len(residuals) < MIN_RESIDUALS:
             return None
@@ -267,8 +372,9 @@ def compute_residuals(
         logging.warning(f"historical_forecasts failed: {e}. Trying fallback.")
         # Fallback: re-predict the full training series for approximate residuals.
         try:
-            fitted_ts = model.predict(len(train_ts), series=train_ts, num_samples=1)
-            predicted = fitted_ts.values().flatten()
+            fitted_t  = model.predict(len(train_ts), series=train_t, num_samples=1)
+            fitted    = invert_transformation(fitted_t, transformer)
+            predicted = fitted.values().flatten()
             actual    = train_ts.values().flatten()
             residuals = actual - predicted
             if len(residuals) < MIN_RESIDUALS:
@@ -282,19 +388,11 @@ def compute_residuals(
 # -----------------------------
 # Residual bootstrap
 #
-# Replicates Jamie's R approach (generate(times=1000)):
-#   For each of n_samples paths:
-#     - draw h residuals with replacement from in-sample residuals
-#     - simulated_path = point_forecast + drawn_residuals
-#     - sum months falling in year_of_interest
-#     - add lag_cumulative_observed_cases
+# Replicates Jamie's R approach (generate(times=1000)).
+# point_forecast and residuals are both on the ORIGINAL scale, so the
+# bootstrap paths are also on the original scale -- no inversion needed here.
 #
 # Returns array of shape (n_samples,) -- one annual total per bootstrap path.
-#
-# Unlike Darts' internal marginal sampling, residuals are drawn jointly for
-# each path (one draw of h values per path), which means errors do NOT cancel
-# when summed across months -- matching the compounding uncertainty of R's
-# sequential path simulation.
 # -----------------------------
 def residual_bootstrap_annual_samples(
     point_forecast:      np.ndarray,
@@ -368,13 +466,14 @@ def build_origins_df(monthly_cases: pd.Series) -> pd.DataFrame:
 # Core forecast function
 # -----------------------------
 def run_annual_forecast(
-    monthly_cases: pd.Series,
-    model_name:    str,
-    origins_df:    pd.DataFrame,
+    monthly_cases:  pd.Series,
+    model_name:     str,
+    origins_df:     pd.DataFrame,
+    transformation: str = "none",
 ) -> pd.DataFrame:
 
-    all_rows    = []
-    rng         = np.random.default_rng(seed=42)
+    all_rows     = []
+    rng          = np.random.default_rng(seed=42)
     stats_models = {"ARIMA", "ETS", "Prophet"}
 
     for _, row in origins_df.iterrows():
@@ -400,23 +499,34 @@ def run_annual_forecast(
         train_ts = TimeSeries.from_series(train_slice)
 
         # ------------------------------------------------------------------
-        # 2. Fit model
+        # 2. Apply transformation, fit model
         # ------------------------------------------------------------------
+        train_t, transformer = apply_transformation(train_ts, transformation)
+
         model = get_model(model_name=model_name, forecast_length=h)
-        model.fit(train_ts)
+        model.fit(train_t)
 
         # ------------------------------------------------------------------
-        # 3. Point forecast -- deterministic (num_samples=1)
+        # 3. Point forecast in transformed space, then invert to original scale
         # ------------------------------------------------------------------
-        fc_point   = model.predict(h, num_samples=1)
-        point_vals = fc_point.all_values()[:, 0, 0]  # shape (h,)
+        fc_t       = model.predict(h, num_samples=1)
+        fc_point   = invert_transformation(fc_t, transformer)
+        point_vals = fc_point.all_values()[:, 0, 0]  # shape (h,), original scale
 
         forecast_timestamps = pd.date_range(origin_ts, periods=h, freq="MS")
 
         # ------------------------------------------------------------------
-        # 4. In-sample residuals for bootstrap uncertainty
+        # 4. In-sample residuals on the original scale
+        #    historical_forecasts run on transformed series, then inverted;
+        #    actuals taken from original train_ts -- residuals on original scale
         # ------------------------------------------------------------------
-        residuals = compute_residuals(model, train_ts, model_name)
+        residuals = compute_residuals(
+            model       = model,
+            train_ts    = train_ts,
+            train_t     = train_t,
+            transformer = transformer,
+            model_name  = model_name,
+        )
 
         if residuals is None:
             logging.warning(
@@ -427,6 +537,7 @@ def run_annual_forecast(
 
         # ------------------------------------------------------------------
         # 5. Residual bootstrap -- replicate Jamie's generate(times=1000)
+        #    point_forecast and residuals are both on original scale
         # ------------------------------------------------------------------
         annual_samples = residual_bootstrap_annual_samples(
             point_forecast      = point_vals,
@@ -454,6 +565,7 @@ def run_annual_forecast(
             "month_forecasting_from":             origin_ts,
             "year_of_interest_plus_prev_months":  Y,
             "model":                              model_name,
+            "transformation":                     transformation,
             **quantile_vals,
             "months_to_forecast":                 h,
             "number_of_months_to_forecast":       f"{h} months",
@@ -462,6 +574,7 @@ def run_annual_forecast(
         all_rows.append(result_row)
         logging.info(
             f"Origin {origin_ts.date()} -> Y={Y}: h={h}, "
+            f"transform={transformation}, "
             f"n_residuals={len(residuals)}, "
             f"obs_carried={lag_cumulative:,.0f}, "
             f"mean={mean_val:,.0f}, "
@@ -506,6 +619,20 @@ if __name__ == "__main__":
             "If omitted, runs all years in YEARS_TO_EXPLORE."
         ),
     )
+    parser.add_argument(
+        "--transformation",
+        type=str,
+        default="none",
+        choices=["none", "log1p", "scaler", "boxcox"],
+        help=(
+            "Transformation applied to training data before fitting. "
+            "Point forecast and historical forecasts are inverted to the original "
+            "scale before residuals are computed, so the bootstrap and all "
+            "downstream quantiles remain on the original case-count scale. "
+            "Options: none (default), log1p, scaler (min-max), boxcox. "
+            "Example: --transformation log1p"
+        ),
+    )
     args = parser.parse_args()
 
     if args.season_end_year is not None:
@@ -516,14 +643,19 @@ if __name__ == "__main__":
         f"Series: {monthly_cases.index.min().date()} to "
         f"{monthly_cases.index.max().date()} ({len(monthly_cases)} months)"
     )
-    logging.info(f"INPUT_CHUNK_LENGTH={INPUT_CHUNK_LENGTH}, NUM_SAMPLES={NUM_SAMPLES}")
+    logging.info(
+        f"INPUT_CHUNK_LENGTH={INPUT_CHUNK_LENGTH}, "
+        f"NUM_SAMPLES={NUM_SAMPLES}, "
+        f"transformation={args.transformation}"
+    )
 
     origins_df = build_origins_df(monthly_cases)
 
     df_out = run_annual_forecast(
-        monthly_cases=monthly_cases,
-        model_name=args.model,
-        origins_df=origins_df,
+        monthly_cases  = monthly_cases,
+        model_name     = args.model,
+        origins_df     = origins_df,
+        transformation = args.transformation,
     )
 
     out_dir = os.path.join(OUT_DIR, args.model.replace(" ", "_"))
@@ -531,7 +663,8 @@ if __name__ == "__main__":
 
     year_tag = str(args.season_end_year) if args.season_end_year else "all_years"
     out_path = os.path.join(
-        out_dir, f"{args.model}_annual_total_forecast_{year_tag}.csv"
+        out_dir,
+        f"{args.model}_transform_{args.transformation}_annual_total_forecast_{year_tag}.csv"
     )
     df_out.to_csv(out_path, index=False)
     logging.info(f"Saved: {out_path}  ({len(df_out)} rows)")
