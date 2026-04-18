@@ -25,6 +25,7 @@ from darts.models import (
     AutoARIMA,
     Prophet,
     DLinearModel,
+    LightGBMModel,
     NLinearModel,
     AutoTheta,
     AutoTBATS,
@@ -34,6 +35,9 @@ from darts.models import (
     NBEATSModel,
     LinearRegressionModel,
     AutoETS,
+    TransformerModel,
+    Chronos2Model
+
 )
 
 # -----------------------------
@@ -82,8 +86,18 @@ def get_model(model_name: str, forecast_length: int):
     elif model_name == "NLinear":
         return NLinearModel(input_chunk_length=INPUT_CHUNK_LENGTH, output_chunk_length=forecast_length,
                             likelihood=ql, pl_trainer_kwargs=pl_trainer_kwargs)
+    elif model_name == "Chronos":
+        return Chronos2Model(
+            input_chunk_length=INPUT_CHUNK_LENGTH, output_chunk_length=forecast_length,
+            likelihood=ql)
+    elif model_name == "Transformer":
+        return TransformerModel(input_chunk_length=INPUT_CHUNK_LENGTH, output_chunk_length=forecast_length,
+                            likelihood=ql, pl_trainer_kwargs=pl_trainer_kwargs)
     elif model_name == "Linear Regress":
         return LinearRegressionModel(lags=INPUT_CHUNK_LENGTH, output_chunk_length=forecast_length,
+                                     likelihood="quantile", quantiles=QUANTILES)
+    elif model_name == "LGBM":
+        return LightGBMModel(lags=INPUT_CHUNK_LENGTH, output_chunk_length=forecast_length,
                                      likelihood="quantile", quantiles=QUANTILES)
     elif model_name == "Theta":
         return AutoTheta(season_length=12)
