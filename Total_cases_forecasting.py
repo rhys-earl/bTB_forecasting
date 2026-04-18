@@ -26,6 +26,9 @@ from darts.models import (
     Prophet,
     DLinearModel,
     NLinearModel,
+    AutoTheta,
+    AutoTBATS,
+    AutoCES,
     TiDEModel,
     NHiTSModel,
     NBEATSModel,
@@ -82,6 +85,12 @@ def get_model(model_name: str, forecast_length: int):
     elif model_name == "Linear Regress":
         return LinearRegressionModel(lags=INPUT_CHUNK_LENGTH, output_chunk_length=forecast_length,
                                      likelihood="quantile", quantiles=QUANTILES)
+    elif model_name == "Theta":
+        return AutoTheta(season_length=12)
+    elif model_name == "CES":
+        return AutoCES(season_length=12)
+    elif model_name == "TBATS":
+        return AutoTBATS(season_length=12)
     elif model_name == "Prophet":
         return Prophet(yearly_seasonality=True)
     elif model_name == "ARIMA":

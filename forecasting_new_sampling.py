@@ -22,6 +22,9 @@ from darts import TimeSeries
 from darts.dataprocessing.transformers import BoxCox, Scaler
 from darts.models import (
     AutoARIMA,
+    AutoTheta,
+    AutoTBATS,
+    AutoCES,
     Prophet,
     DLinearModel,
     NLinearModel,
@@ -80,6 +83,12 @@ def get_model(model_name: str, forecast_length: int):
                             pl_trainer_kwargs=pl_trainer_kwargs)
     elif model_name == "Linear Regress":
         return LinearRegressionModel(lags=INPUT_CHUNK_LENGTH, output_chunk_length=forecast_length)
+    elif model_name == "Theta":
+        return AutoTheta(season_length=12)
+    elif model_name == "CES":
+        return AutoCES(season_length=12)
+    elif model_name == "TBATS":
+        return AutoTBATS(season_length=12)
     elif model_name == "Prophet":
         return Prophet(yearly_seasonality=True)
     elif model_name == "ARIMA":
