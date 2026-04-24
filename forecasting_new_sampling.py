@@ -235,7 +235,7 @@ def compute_residuals(
             start_format="position",
             forecast_horizon=1,
             stride=1,
-            retrain=False,
+            retrain=True,
             overlap_end=False,
             last_points_only=True,
             num_samples=1,
